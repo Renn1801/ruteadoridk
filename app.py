@@ -7,7 +7,7 @@ from geopy.geocoders import Nominatim
 import folium
 from streamlit_folium import st_folium
 
-# Función para normalizar: quita acentos y pasa a mayúsculas
+# quita acentos y pasa a mayúsculas
 def normalizar_texto(texto):
     if pd.isna(texto): return ""
     # Normaliza a forma NFD (separa el acento de la letra)
@@ -31,16 +31,27 @@ st.markdown("""
 st.logo("logo.png")
 st.markdown("<h1 style='text-align: left; color: white; font-size: 70px;'>BRAT LOGISTICA</h1>", unsafe_allow_html=True)
 col1, col2 = st.columns(2)
-# Descargar Plantilla de Ejemplo
-archivo_plantilla = "plantilla.xlsx"
 
-with open(archivo_plantilla, "rb") as file:
-    btn = st.download_button(
-        label="📥 Descargar plantilla de ejemplo",
-        data=file,
-        file_name="plantilla.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+# Descargar de archivos
+archivo_plantilla = "plantilla.xlsx"
+archivo_asignaciones = "plantilla_asignaciones.xlsx"
+with col1:
+    with open(archivo_plantilla, "rb") as file:
+        btn1 = st.download_button(  # Cambié a btn1 para diferenciarlo
+            label="📥 Descargar plantilla de ejemplo",
+            data=file,
+            file_name="plantilla.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+with col2:
+    with open(archivo_asignaciones, "rb") as file:
+        btn2 = st.download_button(  # Cambié a btn2 para diferenciarlo
+            label="📥 Descargar plantilla de asignaciones",
+            data=file,
+            file_name="plantilla_asignaciones.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 # Subida de archivos
 with col1:
     up_ped = st.file_uploader("Subir plantilla_pedidos.xlsx", type=["xlsx"])
@@ -62,35 +73,28 @@ if up_ped and up_asig and os.path.exists('maestro_zonas.xlsx'):
     else:
         st.error("El archivo ASIGNACIONES debe tener la columna 'Codigo'.")
     
-    # Preparamos las llaves normalizadas
     pedidos['key'] = pedidos['Localidad'].apply(normalizar_texto)
     
-    # Asumimos que la columna 0 de reglas es la Localidad
     reglas_tmp = reglas.copy()
     reglas_tmp.columns = ['key', 'Codigo'] # Aseguramos nombres
     reglas_tmp['key'] = reglas_tmp['key'].apply(normalizar_texto)
     
-    # Merge usando las llaves normalizadas
     df = pedidos.merge(reglas_tmp[['key', 'Codigo']], on='key', how='left')
     df = df.merge(asig, on='Codigo', how='left')
     
-    # Evitar duplicar filas del pedido cuando ASIGNACIONES tiene el mismo Codigo repetido
     if '_orig_index' in df.columns:
         df = df.drop_duplicates(subset=['_orig_index', 'Codigo', 'Chofer'], keep='first').copy()
 
     if 'key' in df.columns:
         df = df.drop(columns=['key'])
     
-    # Normalizar la columna 'Chofer' para evitar tipos mixtos (NaN -> cadena)
     if 'Chofer' in df.columns:
         df['Chofer'] = df['Chofer'].fillna('Sin Chofer').astype(str).str.strip()
     else:
         df['Chofer'] = 'Sin Chofer'
 
-    # Separar filas sin chofer para revisarlas por separado (no las procesamos en el mapa)
     mask_sin_chofer = df['Chofer'].str.strip().str.lower().isin(['', 'sin chofer', 'none'])
     df_sin_chofer = df[mask_sin_chofer].copy()
-    # DataFrame que sí procesaremos (solo filas con chofer asignado)
     df = df[~mask_sin_chofer].copy()
 
     if '_orig_index' in df.columns:
@@ -101,7 +105,6 @@ if up_ped and up_asig and os.path.exists('maestro_zonas.xlsx'):
     st.write("### Resultados en pantalla")
     st.dataframe(df)
     
-    # Preparar archivo de exportación incluyendo filas sin chofer (para revisión)
     try:
         df_export = pd.concat([df, df_sin_chofer], ignore_index=True)
     except NameError:
@@ -141,21 +144,19 @@ if up_ped and up_asig and os.path.exists('maestro_zonas.xlsx'):
         direccion = str(direccion).strip()
         localidad = str(localidad).strip()
         
-        # Limpieza y normalización de la dirección
+        # Limpieza
         direccion = re.sub(r'\bDr\b\.?', 'Doctor', direccion, flags=re.IGNORECASE)
         direccion = re.sub(r'\bAv\b\.?', 'Avenida', direccion, flags=re.IGNORECASE)
         direccion = re.sub(r'\bex\b', 'y', direccion, flags=re.IGNORECASE)
         direccion = re.sub(r'\bSN\b\.?', '', direccion, flags=re.IGNORECASE).strip()
         localidad = localidad.replace(' ex ', ' y ')
         
-        # Solo 3 búsquedas (optimizado)
         busquedas = [
             f"{direccion}, {localidad}, Buenos Aires, Argentina",
             f"{localidad}, Buenos Aires, Argentina",
             f"{localidad}",
         ]
         
-        # Intenta con ArcGIS primero (más rápido para Argentina)
         for busqueda in busquedas:
             try:
                 location = geolocator_arcgis.geocode(busqueda, timeout=5)
@@ -164,7 +165,6 @@ if up_ped and up_asig and os.path.exists('maestro_zonas.xlsx'):
             except:
                 pass
         
-        # Fallback: Nominatim
         for busqueda in busquedas:
             try:
                 location = geolocator_nominatim.geocode(busqueda, timeout=5)
@@ -199,26 +199,21 @@ if up_ped and up_asig and os.path.exists('maestro_zonas.xlsx'):
         df['Lat'] = df.index.map(resultados_lat)
         df['Lon'] = df.index.map(resultados_lon)
 
-    # 1. Mapa con colores por chofer
     df_mapa = df.dropna(subset=['Lat', 'Lon'])
     m = folium.Map(location=[-34.6, -58.4], zoom_start=10, tiles='OpenStreetMap')
     
-    # Obtener todos los choferes únicos (incluso los sin coordenadas)
     todos_choferes = sorted(df['Chofer'].unique())
     num_choferes = len(todos_choferes)
     
-    # Paleta de colores extendida soportada por folium
     colores_folium = ['red', 'blue', 'green', 'purple', 'orange', 'darkred', 'darkblue', 
                       'darkgreen', 'cadetblue', 'darkpurple', 'pink', 'gray', 'lightred', 
                       'lightblue', 'lightgreen', 'lightgray', 'beige', 'lightcyan', 'black']
     
-    # Si hay más choferes que colores base, extender la paleta
     if num_choferes > len(colores_folium):
         colores_disponibles = (colores_folium * ((num_choferes // len(colores_folium)) + 1))[:num_choferes]
     else:
         colores_disponibles = colores_folium[:num_choferes]
     
-    # Generar colores hexadecimales para el dashboard (mismo orden)
     import colorsys
     
     def generar_colores_hex(n):
@@ -242,7 +237,6 @@ if up_ped and up_asig and os.path.exists('maestro_zonas.xlsx'):
     
     from folium.features import DivIcon
 
-    # Agregar marcadores precisos con iconos SVG y hex colors
     coord_counts = {}
     for _, row in df_mapa.iterrows():
         lat = row['Lat']
@@ -299,26 +293,24 @@ if up_ped and up_asig and os.path.exists('maestro_zonas.xlsx'):
             icon=icon
         ).add_to(m)
 
-    # Mostrar mapa a ancho completo
+    # ANCHO DE MAPA!!!
     st_folium(m, width=1400, height=700)
 
-    # Dashboard con gráfico de barras
+    #DASH
     st.write("---")
     st.write("### Distribución de Paquetes por Chofer")
     
-    # Contar paquetes por chofer
+    # Contar
     paquetes_por_chofer = df_mapa['Chofer'].value_counts().sort_values(ascending=True)
     total_paquetes = paquetes_por_chofer.sum()
     
-    # Crear gráfico de barras con plotly
+    #PLOTLY!!!!
     import plotly.graph_objects as go
     
-    # Preparar datos para el gráfico
     choferes = paquetes_por_chofer.index.tolist()
     cantidades = paquetes_por_chofer.values.tolist()
     colores = [mapa_colores_chofer_hex[chofer] for chofer in choferes]
     
-    # Crear figura
     fig = go.Figure(
         data=[go.Bar(
             x=cantidades,
@@ -331,7 +323,6 @@ if up_ped and up_asig and os.path.exists('maestro_zonas.xlsx'):
         )]
     )
     
-    # Configurar layout
     fig.update_layout(
         title=dict(text=f"Total: {total_paquetes} paquetes", font=dict(color='#ffffff', size=16)),
         xaxis_title="Cantidad de Paquetes",
@@ -359,19 +350,17 @@ if up_ped and up_asig and os.path.exists('maestro_zonas.xlsx'):
     
     st.plotly_chart(fig, use_container_width=True)
 
-    # 2. LISTADO DE ERRORES (Aquí ves las que fallaron)
+    # LISTADO DE ERRORES
     df_errores = df[df['Lat'].isna()]
 
     if not df_errores.empty:
         st.error(f"⚠️ Atención: No se pudieron geolocalizar {len(df_errores)} direcciones:")
-        # Mostramos solo la dirección y localidad para identificar rápido el error
         st.table(df_errores[['Direccion', 'Localidad']])
     else:
         st.success("✅ ¡Todas las direcciones fueron ubicadas correctamente!")
     
-    # Mostrar filas que no tenían chofer asignado (no fueron procesadas en el mapa)
     if 'df_sin_chofer' in locals() and not df_sin_chofer.empty:
         st.warning(f"⚠️ Hay {len(df_sin_chofer)} filas sin chofer asignado (no procesadas en el mapa):")
         cols_show = [c for c in ['Direccion', 'Localidad', 'Codigo', 'Chofer'] if c in df_sin_chofer.columns]
         st.table(df_sin_chofer[cols_show])
-    # --- FIN BLOQUE MAPA ---
+    
