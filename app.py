@@ -1,19 +1,58 @@
+from geopy import geocoders
 import streamlit as st
 import pandas as pd
 import io
 import os
 import unicodedata
-from geopy.geocoders import Nominatim
+from geopy.geocoders import ArcGIS, Nominatim, Photon
 import folium
 from streamlit_folium import st_folium
+import re
+import time
 
-# quita acentos y pasa a mayúsculas
+# api
+geo_arcgis = ArcGIS(user_agent="app_logistica_renzo")
+geo_photon = Photon(user_agent="app_logistica_renzo")
+geo_osm = Nominatim(user_agent="app_logistica_renzo")
+
+# limpieza
+def limpiar_direccion_para_mapa(direccion):
+    if pd.isna(direccion): return ""
+    d = str(direccion).upper() # Todo a mayúsculas
+    
+    # 1. Quitar basura de horarios y descripciones extra
+    d = re.sub(r'HASTA LAS.*', '', d)
+    d = re.sub(r'ESQ\..*', '', d)
+    d = re.sub(r'PISO:.*', '', d)
+    d = re.sub(r'DEPARTAMENTO:.*', '', d)
+    d = re.sub(r'MANZANA.*', '', d)
+    d = re.sub(r'ENTRE.*', '', d)
+    d = re.sub(r'CASA', '', d)
+    d = re.sub(r'SN', '', d)
+    
+    # 2. Reemplazos críticos
+    reemplazos = {
+        "AV.": "AVENIDA ",
+        "AV ": "AVENIDA ",
+        "N°": "",
+        "NRO": ""
+    }
+    for k, v in reemplazos.items():
+        d = d.replace(k, v)
+        
+    # 3. Limpiar espacios extra
+    d = re.sub(r'\s+', ' ', d)
+    return d.strip()
+
+# mas limpieza
 def normalizar_texto(texto):
     if pd.isna(texto): return ""
-    # Normaliza a forma NFD (separa el acento de la letra)
     nfkd_form = unicodedata.normalize('NFKD', str(texto).upper())
-    # Filtra y devuelve solo los caracteres que no son combinables (sin acento)
     return "".join([c for c in nfkd_form if not unicodedata.combining(c)]).strip()
+
+def procesar_fila(idx, row):
+            coords = buscar_coordenadas(row['Direccion'], row['Localidad'], row.get('cp', ''))
+            return idx, coords[0], coords[1]
 
 st.set_page_config(layout="wide", page_title="Ruteador BRAT", page_icon="logo.png")
 st.markdown("""
@@ -63,6 +102,10 @@ if up_ped and up_asig and os.path.exists('maestro_zonas.xlsx'):
     asig = pd.read_excel(up_asig)
     reglas = pd.read_excel('maestro_zonas.xlsx')
 
+    # Normalizar CP como texto para que funcione igual si viene como número o como string
+    if 'cp' in pedidos.columns:
+        pedidos['cp'] = pedidos['cp'].astype(str).str.strip()
+
     pedidos['_orig_index'] = pedidos.index
 
     if 'Codigo' in asig.columns:
@@ -83,7 +126,7 @@ if up_ped and up_asig and os.path.exists('maestro_zonas.xlsx'):
     df = df.merge(asig, on='Codigo', how='left')
     
     if '_orig_index' in df.columns:
-        df = df.drop_duplicates(subset=['_orig_index', 'Codigo', 'Chofer'], keep='first').copy()
+        df = df.sort_values(by=['_orig_index']).drop_duplicates(subset=['_orig_index'], keep='first').copy()
 
     if 'key' in df.columns:
         df = df.drop(columns=['key'])
@@ -128,76 +171,80 @@ if up_ped and up_asig and os.path.exists('maestro_zonas.xlsx'):
     # --- BLOQUE MAPA CON AVISO DE ERRORES ---
     st.write("### Mapa de Distribución")
 
-    from geopy.geocoders import Nominatim, ArcGIS
+    from geopy.geocoders import ArcGIS
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
     geolocator_arcgis = ArcGIS()
-    geolocator_nominatim = Nominatim(user_agent="logistica_app_v2")
 
-    @st.cache_data
-    def buscar_coordenadas(direccion, localidad):
-        import re
-        
-        if pd.isna(direccion) or pd.isna(localidad):
-            return (None, None)
-        
-        direccion = str(direccion).strip()
-        localidad = str(localidad).strip()
-        
-        # Limpieza
-        direccion = re.sub(r'\bDr\b\.?', 'Doctor', direccion, flags=re.IGNORECASE)
-        direccion = re.sub(r'\bAv\b\.?', 'Avenida', direccion, flags=re.IGNORECASE)
-        direccion = re.sub(r'\bex\b', 'y', direccion, flags=re.IGNORECASE)
-        direccion = re.sub(r'\bSN\b\.?', '', direccion, flags=re.IGNORECASE).strip()
-        localidad = localidad.replace(' ex ', ' y ')
-        
-        busquedas = [
-            f"{direccion}, {localidad}, Buenos Aires, Argentina",
-            f"{localidad}, Buenos Aires, Argentina",
-            f"{localidad}",
-        ]
-        
+    # Geocoders y límites de cobertura (Flex AMBA)
+    geocoders = [geo_arcgis, geo_photon, geo_osm]
+    LAT_MIN, LAT_MAX = -37.00, -33.00
+    LON_MIN, LON_MAX = -60.50, -57.00
+
+    def buscar_con_un_geocoder(geocoder, busquedas):
         for busqueda in busquedas:
             try:
-                location = geolocator_arcgis.geocode(busqueda, timeout=5)
+                location = geocoder.geocode(busqueda, timeout=4)
                 if location:
-                    return (location.latitude, location.longitude)
+                    lat, lon = location.latitude, location.longitude
+                    if LAT_MIN <= lat <= LAT_MAX and LON_MIN <= lon <= LON_MAX:
+                        return lat, lon
             except:
                 pass
-        
-        for busqueda in busquedas:
-            try:
-                location = geolocator_nominatim.geocode(busqueda, timeout=5)
-                if location:
-                    return (location.latitude, location.longitude)
-            except:
-                pass
-        
         return (None, None)
 
-    with st.spinner('Procesando ubicaciones...'):
-        # Procesamiento paralelo para acelerar geocodificación
-        def procesar_fila(idx, row):
-            coords = buscar_coordenadas(row['Direccion'], row['Localidad'])
-            return idx, coords[0], coords[1]
+    @st.cache_data
+    def buscar_coordenadas(direccion, localidad, cp):
+        direccion_limpia = limpiar_direccion_para_mapa(direccion)
+        if pd.isna(direccion) or pd.isna(localidad):
+            return (None, None)
+
+        cp_str = str(cp).strip() if not pd.isna(cp) else ""
+        localidad_str = str(localidad).strip()
+
+        busquedas = []
+        if cp_str:
+            busquedas.extend([
+                f"{direccion_limpia}, {cp_str}, Buenos Aires, Argentina",
+                f"{localidad_str}, {cp_str}, Buenos Aires, Argentina",
+            ])
+        busquedas.extend([
+            f"{direccion_limpia}, {localidad_str}, Buenos Aires, Argentina",
+            f"{localidad_str}, Buenos Aires, Argentina",
+        ])
+
+        # Intentar cada geocoder hasta encontrar una ubicación válida dentro de bounds
+        for g in geocoders:
+            latlon = buscar_con_un_geocoder(g, busquedas)
+            if latlon[0] is not None:
+                return latlon
+        return (None, None)
+
+    # BARRA DE PROGRESO
+    progreso_bar = st.progress(0)
+    total = len(df)
+    procesadas = 0
+    
+    resultados_lat = {}
+    resultados_lon = {}
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(procesar_fila, idx, row): idx for idx, row in df.iterrows()}
         
-        # Usar hasta 4 threads para no sobrecargar los servidores de geocodificación
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = {executor.submit(procesar_fila, idx, row): idx for idx, row in df.iterrows()}
-            
-            resultados_lat = {}
-            resultados_lon = {}
-            
-            for future in as_completed(futures):
-                try:
-                    idx, lat, lon = future.result()
-                    resultados_lat[idx] = lat
-                    resultados_lon[idx] = lon
-                except:
-                    pass
-        
-        df['Lat'] = df.index.map(resultados_lat)
-        df['Lon'] = df.index.map(resultados_lon)
+        for future in as_completed(futures):
+            try:
+                idx, lat, lon = future.result()
+                resultados_lat[idx] = lat
+                resultados_lon[idx] = lon
+            except:
+                pass
+
+            procesadas += 1
+            progreso_bar.progress(procesadas / total)
+
+    # 4. Asignamos los resultados al DataFrame una vez que el bucle terminó
+    df['Lat'] = df.index.map(resultados_lat)
+    df['Lon'] = df.index.map(resultados_lon)
 
     df_mapa = df.dropna(subset=['Lat', 'Lon'])
     m = folium.Map(location=[-34.6, -58.4], zoom_start=10, tiles='OpenStreetMap')
@@ -301,8 +348,9 @@ if up_ped and up_asig and os.path.exists('maestro_zonas.xlsx'):
     st.write("### Distribución de Paquetes por Chofer")
     
     # Contar
+    total_pedidos_reales = len(df)  # Total real de pedidos con chofer
     paquetes_por_chofer = df_mapa['Chofer'].value_counts().sort_values(ascending=True)
-    total_paquetes = paquetes_por_chofer.sum()
+    total_paquetes_geocodificados = paquetes_por_chofer.sum()
     
     #PLOTLY!!!!
     import plotly.graph_objects as go
@@ -313,18 +361,18 @@ if up_ped and up_asig and os.path.exists('maestro_zonas.xlsx'):
     
     fig = go.Figure(
         data=[go.Bar(
-            x=cantidades,
-            y=choferes,
-            orientation='h',
+            x=choferes,
+            y=cantidades,
+            orientation='v',
             marker=dict(color=colores),
-            text=[f"{int(c)} paquetes" for c in cantidades],
-            textposition='auto',
+            text=[f"{int(c)}" for c in cantidades],
+            textposition='outside',
             hovertemplate='<b>%{y}</b><br>Paquetes: %{x}<extra></extra>'
         )]
     )
     
     fig.update_layout(
-        title=dict(text=f"Total: {total_paquetes} paquetes", font=dict(color='#ffffff', size=16)),
+        title=dict(text=f"Total en mapa: {total_paquetes_geocodificados}/{total_pedidos_reales} paquetes", font=dict(color='#ffffff', size=16)),
         xaxis_title="Cantidad de Paquetes",
         yaxis_title="Chofer",
         height=max(300, len(choferes) * 30),
@@ -345,6 +393,38 @@ if up_ped and up_asig and os.path.exists('maestro_zonas.xlsx'):
             zeroline=False
         )
     )
+
+    # Botón de prueba: mostrar cómo se repartirían las primeras filas entre geocoders
+    if st.button('Probar round-robin geocoders (6 filas)'):
+        prueba = []
+        sample = df.head(6).reset_index()
+        for i, row in sample.iterrows():
+            direccion = row['Direccion']
+            localidad = row['Localidad']
+            cp = row.get('cp', '') if 'cp' in row else ''
+            direccion_limpia = limpiar_direccion_para_mapa(direccion)
+            localidad_str = str(localidad).strip()
+            cp_str = str(cp).strip() if not pd.isna(cp) else ''
+            busquedas = []
+            if cp_str:
+                busquedas.extend([
+                    f"{direccion_limpia}, {cp_str}, Buenos Aires, Argentina",
+                    f"{localidad_str}, {cp_str}, Buenos Aires, Argentina",
+                ])
+            busquedas.extend([
+                f"{direccion_limpia}, {localidad_str}, Buenos Aires, Argentina",
+                f"{localidad_str}, Buenos Aires, Argentina",
+            ])
+            g = geocoders[i % len(geocoders)]
+            lat, lon = buscar_con_un_geocoder(g, busquedas)
+            prueba.append({
+                'idx': row['index'],
+                'Direccion': direccion,
+                'Geocoder': g.__class__.__name__,
+                'Lat': lat,
+                'Lon': lon
+            })
+        st.table(pd.DataFrame(prueba))
     
     fig.update_traces(textfont=dict(color='#ffffff', size=11))
     
